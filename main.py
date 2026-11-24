@@ -21,14 +21,25 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.styles.colors import COLOR_INDEX
 from openpyxl.utils import get_column_letter
 from pydantic import BaseModel, Field
 
+import local_ai
+from insights import (
+    analytics_dataframe,
+    anomaly_report,
+    audit_prompt,
+    compile_audit_summary,
+    profile_dataframe,
+    reconcile_dataframes,
+)
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
-app = FastAPI(title="Local Data Analytics API")
+app = FastAPI(title="DataLens Linux — Avtomatik Excel Analizator")
 app.mount(
     "/static",
     StaticFiles(directory=PROJECT_DIR / "static"),
@@ -37,6 +48,47 @@ app.mount(
 
 # Data is kept in process memory and is cleared when the server restarts.
 datasets: dict[str, dict[str, Any]] = {}
+reconciliation_reports: dict[str, dict[str, Any]] = {}
+
+
+class AnalysisRequest(BaseModel):
+    file_id: str
+    sheet_name: str
+    group_by: str | None = None
+    metric: str | None = None
+    order_by: str | None = None
+
+
+class ReconciliationRequest(BaseModel):
+    left_file_id: str
+    left_sheet_name: str
+    left_key_column: str
+    left_amount_column: str
+    right_file_id: str
+    right_sheet_name: str
+    right_key_column: str
+    right_amount_column: str
+    tolerance: float = Field(default=0.01, ge=0)
+
+
+class AuditRequest(BaseModel):
+    file_id: str
+    sheet_name: str
+
+
+class FullExportRequest(BaseModel):
+    file_id: str
+    sheet_name: str
+
+
+class ColorAnalysisRequest(BaseModel):
+    file_id: str
+
+
+class SmartCleaningRequest(BaseModel):
+    file_id: str
+    sheet_name: str
+    use_ai: bool = False
 
 
 @app.exception_handler(RequestValidationError)
@@ -272,11 +324,12 @@ def conditional_font_color_cells(
 def unique_column_headers(cells: list[Any]) -> list[str]:
     used = set(COLOR_METADATA_COLUMNS)
     headers: list[str] = []
-    for cell in cells:
+    for column_number, cell in enumerate(cells, start=1):
+        value = cell.value if hasattr(cell, "value") else cell
         base = (
-            str(cell.value)
-            if cell.value is not None and str(cell.value).strip()
-            else f"Sütun {get_column_letter(cell.column)}"
+            str(value)
+            if value is not None and str(value).strip()
+            else f"Sütun {get_column_letter(getattr(cell, 'column', column_number))}"
         )
         candidate = base
         suffix = 2
@@ -321,6 +374,139 @@ def worksheet_header_row(worksheet: Any, max_data_row: int, max_data_column: int
         ):
             return row_number
     return 0
+
+
+def read_excel_sheets(
+    content: bytes,
+    extension: str,
+) -> tuple[dict[str, pd.DataFrame], dict[str, dict[str, Any]]]:
+    if extension == ".xls":
+        sheets = pd.read_excel(
+            BytesIO(content),
+            sheet_name=None,
+            engine="xlrd",
+        )
+        return (
+            {str(name): dataframe for name, dataframe in sheets.items()},
+            {},
+        )
+
+    workbook = load_workbook(BytesIO(content), data_only=True)
+    theme_colors = workbook_theme_colors(workbook)
+    sheets: dict[str, pd.DataFrame] = {}
+    formatting: dict[str, dict[str, Any]] = {}
+    for worksheet in workbook.worksheets:
+        populated = [
+            cell
+            for row in worksheet.iter_rows()
+            for cell in row
+            if cell.value is not None
+        ]
+        max_data_column = max((cell.column for cell in populated), default=0)
+        max_data_row = max((cell.row for cell in populated), default=0)
+        if max_data_column == 0:
+            sheets[worksheet.title] = pd.DataFrame()
+            formatting[worksheet.title] = {
+                "header_row": 1,
+                "merged_headers": [],
+                "cells": {},
+            }
+            continue
+
+        candidates: list[tuple[int, int, int]] = []
+        for row_number, row in enumerate(
+            worksheet.iter_rows(
+                min_row=1,
+                max_row=min(max_data_row, 30),
+                max_col=max_data_column,
+            ),
+            start=1,
+        ):
+            values = [cell.value for cell in row if cell.value is not None]
+            if values:
+                text_values = sum(isinstance(value, str) for value in values)
+                candidates.append((len(values), text_values, -row_number))
+        header_row = -max(candidates)[2] if candidates else 1
+        header_cells = list(
+            worksheet.iter_rows(
+                min_row=header_row,
+                max_row=header_row,
+                max_col=max_data_column,
+            )
+        )[0]
+        merged_ranges = [
+            str(cell_range)
+            for cell_range in worksheet.merged_cells.ranges
+        ]
+        merged_prefixes: dict[int, list[str]] = {}
+        for cell_range in worksheet.merged_cells.ranges:
+            if cell_range.max_col <= cell_range.min_col or cell_range.max_col >= max_data_column:
+                continue
+            if cell_range.min_row >= header_row or cell_range.max_row >= header_row:
+                continue
+            label = worksheet.cell(cell_range.min_row, cell_range.min_col).value
+            if label is None or not str(label).strip():
+                continue
+            for column_number in range(cell_range.min_col, cell_range.max_col + 1):
+                merged_prefixes.setdefault(column_number, []).append(str(label).strip())
+
+        raw_headers: list[Any] = []
+        for column_number, cell in enumerate(header_cells, start=1):
+            leaf = str(cell.value).strip() if cell.value is not None else ""
+            prefix = merged_prefixes.get(column_number, [])
+            raw_headers.append(" / ".join([*prefix, leaf]) if prefix else leaf)
+        headers = unique_column_headers(raw_headers)
+        frame = pd.read_excel(
+            BytesIO(content),
+            sheet_name=worksheet.title,
+            header=header_row - 1,
+            engine="openpyxl",
+        )
+        if len(frame.columns) != len(headers):
+            if len(frame.columns) > len(headers):
+                headers.extend(
+                    f"Sütun {get_column_letter(index)}"
+                    for index in range(len(headers) + 1, len(frame.columns) + 1)
+                )
+            else:
+                headers = headers[: len(frame.columns)]
+        frame.columns = headers
+        sheets[worksheet.title] = frame
+
+        cell_formats: dict[str, dict[str, dict[str, Any]]] = {}
+        data_start_row = header_row + 1
+        for dataframe_row in range(len(frame.index)):
+            excel_row = data_start_row + dataframe_row
+            if excel_row > max_data_row:
+                break
+            row_formats: dict[str, dict[str, Any]] = {}
+            for column_number, column_name in enumerate(headers, start=1):
+                cell = worksheet.cell(excel_row, column_number)
+                fill_rgb = (
+                    excel_color_rgb(cell.fill.fgColor, theme_colors)
+                    if cell.fill.fill_type == "solid"
+                    else None
+                )
+                font_rgb = cell_font_rgb(cell, theme_colors)
+                comment = cell.comment.text if cell.comment is not None else None
+                if fill_rgb or font_rgb or cell.font.bold or comment:
+                    row_formats[str(column_name)] = {
+                        "fill_rgb": fill_rgb,
+                        "font_rgb": font_rgb,
+                        "bold": bool(cell.font.bold),
+                        "comment": comment,
+                        "excel_cell": cell.coordinate,
+                    }
+            if row_formats:
+                cell_formats[str(dataframe_row)] = row_formats
+        formatting[worksheet.title] = {
+            "header_row": header_row,
+            "merged_headers": merged_ranges,
+            "cells": cell_formats,
+        }
+
+    workbook.close()
+    return sheets, formatting
 
 
 def extract_color_rows(
@@ -889,7 +1075,9 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
     if not files:
         raise HTTPException(status_code=400, detail="Upload at least one file")
 
-    parsed_files: list[tuple[str, str, bytes, dict[str, pd.DataFrame]]] = []
+    parsed_files: list[
+        tuple[str, str, bytes, dict[str, pd.DataFrame], dict[str, dict[str, Any]]]
+    ] = []
     for upload in files:
         filename = upload.filename or ""
         extension = Path(filename).suffix.lower()
@@ -901,19 +1089,19 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
 
         try:
             content = await upload.read()
+            if len(content) > 100 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Faylın ölçüsü 100 MB həddini keçir.",
+                )
             if extension == ".csv":
                 frame = read_csv_with_fallback(content)
                 sheets = {Path(filename).stem or "Sheet1": frame}
+                formatting = {}
             else:
-                excel_sheets = pd.read_excel(
-                    BytesIO(content),
-                    sheet_name=None,
-                    engine="openpyxl" if extension == ".xlsx" else "xlrd",
-                )
-                sheets = {
-                    str(sheet_name): dataframe
-                    for sheet_name, dataframe in excel_sheets.items()
-                }
+                sheets, formatting = read_excel_sheets(content, extension)
+        except HTTPException:
+            raise
         except Exception as error:
             logger.warning(
                 "Could not read uploaded file %r",
@@ -928,14 +1116,15 @@ async def upload_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
                 ),
             ) from error
 
-        parsed_files.append((filename, extension, content, sheets))
+        parsed_files.append((filename, extension, content, sheets, formatting))
 
-    for filename, extension, content, sheets in parsed_files:
+    for filename, extension, content, sheets, formatting in parsed_files:
         datasets[str(uuid4())] = {
             "filename": filename,
             "file_extension": extension,
             "workbook_bytes": content if extension == ".xlsx" else None,
             "sheets": sheets,
+            "formatting": formatting,
             "previews": {},
             "history": {},
             "cleaning_log": {},
@@ -1157,6 +1346,7 @@ async def merge_sheets(request: MergeRequest) -> dict[str, Any]:
     datasets[merged_file_id] = {
         "filename": f"Birləşdirilmiş məlumat ({files_count} fayl)",
         "sheets": {merged_sheet_name: merged},
+        "formatting": {},
         "previews": {},
         "history": {},
         "cleaning_log": {merged_sheet_name: [log_entry]},
@@ -1324,3 +1514,551 @@ async def export_data(
         media_type=media_type,
         headers={"Content-Disposition": attachment_header(filename)},
     )
+
+
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "application": app.title,
+        "local_only": True,
+        "loaded_datasets": len(datasets),
+        "ai": local_ai.model_status(),
+    }
+
+
+@app.get("/api/ai/status")
+async def ai_status() -> dict[str, Any]:
+    return local_ai.model_status()
+
+
+@app.post("/api/ai/download")
+async def ai_download() -> dict[str, Any]:
+    return local_ai.start_download()
+
+
+@app.post("/api/ai/load")
+async def ai_load() -> dict[str, Any]:
+    return local_ai.start_loading()
+
+
+@app.post("/api/profile")
+async def profile_sheet(request: ValidationTarget) -> dict[str, Any]:
+    _, dataframe = get_dataset_sheet(request.file_id, request.sheet_name)
+    return {
+        "file_id": request.file_id,
+        "sheet_name": request.sheet_name,
+        **profile_dataframe(dataframe),
+    }
+
+
+@app.get("/api/profile")
+async def profile_sheet_query(file_id: str, sheet_name: str) -> dict[str, Any]:
+    return await profile_sheet(ValidationTarget(file_id=file_id, sheet_name=sheet_name))
+
+
+@app.get("/api/formatting/{file_id}")
+async def get_formatting(file_id: str, sheet_name: str) -> dict[str, Any]:
+    dataset, dataframe = get_dataset_sheet(file_id, sheet_name)
+    metadata = dataset.get("formatting", {}).get(
+        sheet_name,
+        {"header_row": 1, "merged_headers": [], "cells": {}},
+    )
+    return {
+        "file_id": file_id,
+        "sheet_name": sheet_name,
+        "header_row": metadata.get("header_row", 1),
+        "merged_headers": metadata.get("merged_headers", []),
+        "columns": [str(column) for column in dataframe.columns],
+        "cells": metadata.get("cells", {}),
+    }
+
+
+@app.post("/api/analytics")
+async def analyze_sheet(request: AnalysisRequest) -> dict[str, Any]:
+    _, dataframe = get_dataset_sheet(request.file_id, request.sheet_name)
+    try:
+        result = analytics_dataframe(
+            dataframe,
+            group_by=request.group_by,
+            metric=request.metric,
+            order_by=request.order_by,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "file_id": request.file_id,
+        "sheet_name": request.sheet_name,
+        **result,
+    }
+
+
+def color_analysis_for_file(file_id: str) -> dict[str, Any]:
+    dataset = datasets.get(file_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Fayl tapılmadı.")
+    if dataset.get("file_extension") != ".xlsx" or not dataset.get("workbook_bytes"):
+        raise HTTPException(
+            status_code=400,
+            detail="Xanaların rəng təhlili formatlı .xlsx faylı tələb edir.",
+        )
+
+    color_rows: dict[str, dict[tuple[str, int], dict[str, Any]]] = {}
+    for sheet_name, style_info in dataset.get("formatting", {}).items():
+        dataframe = dataset["sheets"].get(sheet_name)
+        if dataframe is None:
+            continue
+        for row_text, column_styles in style_info.get("cells", {}).items():
+            row_index = int(row_text)
+            if row_index >= len(dataframe):
+                continue
+            row_colors: dict[str, list[str]] = {}
+            for column, cell_style in column_styles.items():
+                color = cell_style.get("fill_rgb")
+                if color:
+                    row_colors.setdefault(color, []).append(column)
+            for color, columns in row_colors.items():
+                color_rows.setdefault(color, {})[(sheet_name, row_index)] = {
+                    "sheet": sheet_name,
+                    "row": row_index,
+                    "columns": sorted(set(columns)),
+                }
+
+    groups: list[dict[str, Any]] = []
+    for color, selected_rows in sorted(
+        color_rows.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    ):
+        numeric_values: dict[str, list[float]] = {}
+        previews: list[dict[str, Any]] = []
+        sheets: set[str] = set()
+        fill_cells = 0
+        for (sheet_name, row_index), marked in selected_rows.items():
+            dataframe = dataset["sheets"][sheet_name]
+            row = dataframe.iloc[row_index]
+            sheets.add(sheet_name)
+            fill_cells += len(marked["columns"])
+            for column in dataframe.select_dtypes(include="number").columns:
+                value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+                if pd.notna(value) and math.isfinite(float(value)):
+                    numeric_values.setdefault(str(column), []).append(float(value))
+            if len(previews) < 20:
+                previews.append(
+                    {
+                        "sheet": sheet_name,
+                        "excel_row": int(
+                            dataset["formatting"][sheet_name].get("header_row", 1)
+                        ) + row_index + 1,
+                        "columns": marked["columns"],
+                        "values": {
+                            str(column): json_safe_cell(value)
+                            for column, value in row.items()
+                        },
+                    }
+                )
+
+        metrics: list[dict[str, Any]] = []
+        for column, values in numeric_values.items():
+            series = pd.Series(values, dtype="float64")
+            first_tier, second_tier = series.quantile([1 / 3, 2 / 3]).tolist()
+            tiers = {
+                "low": int((series <= first_tier).sum()),
+                "medium": int(((series > first_tier) & (series <= second_tier)).sum()),
+                "high": int((series > second_tier).sum()),
+            }
+            metrics.append(
+                {
+                    "column": column,
+                    "count": len(values),
+                    "sum": float(series.sum()),
+                    "average": float(series.mean()),
+                    "minimum": float(series.min()),
+                    "maximum": float(series.max()),
+                    "tiers": tiers,
+                }
+            )
+        groups.append(
+            {
+                "color": f"#{color}",
+                "rgb": color,
+                "row_count": len(selected_rows),
+                "fill_cells": fill_cells,
+                "sheets": sorted(sheets),
+                "numeric_metrics": metrics,
+                "preview_rows": previews,
+            }
+        )
+    return {
+        "file_id": file_id,
+        "scanned_sheets": len(dataset["sheets"]),
+        "groups": groups,
+    }
+
+
+@app.post("/api/colors/analyze")
+async def analyze_fill_colors(request: ColorAnalysisRequest) -> dict[str, Any]:
+    return color_analysis_for_file(request.file_id)
+
+
+@app.post("/api/reconcile")
+async def reconcile_sheets(request: ReconciliationRequest) -> dict[str, Any]:
+    _, left = get_dataset_sheet(request.left_file_id, request.left_sheet_name)
+    _, right = get_dataset_sheet(request.right_file_id, request.right_sheet_name)
+    try:
+        result = reconcile_dataframes(
+            left,
+            right,
+            request.left_key_column,
+            request.right_key_column,
+            request.left_amount_column,
+            request.right_amount_column,
+            request.tolerance,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    result["sources"] = {
+        "left": {
+            "file_id": request.left_file_id,
+            "sheet_name": request.left_sheet_name,
+            "key_column": request.left_key_column,
+            "amount_column": request.left_amount_column,
+        },
+        "right": {
+            "file_id": request.right_file_id,
+            "sheet_name": request.right_sheet_name,
+            "key_column": request.right_key_column,
+            "amount_column": request.right_amount_column,
+        },
+    }
+    reconciliation_reports[request.left_file_id] = result
+    return result
+
+
+@app.post("/api/anomalies")
+async def analyze_anomalies(request: ValidationTarget) -> dict[str, Any]:
+    _, dataframe = get_dataset_sheet(request.file_id, request.sheet_name)
+    return anomaly_report(dataframe)
+
+
+@app.post("/api/audit/summary")
+async def compile_summary(request: AuditRequest) -> dict[str, Any]:
+    dataset, dataframe = get_dataset_sheet(request.file_id, request.sheet_name)
+    summary = compile_audit_summary(
+        dataset["filename"],
+        request.sheet_name,
+        dataframe,
+    )
+    dataset.setdefault("audit_summaries", {})[request.sheet_name] = summary
+    dataset.setdefault("anomaly_reports", {})[request.sheet_name] = anomaly_report(dataframe)
+    return summary
+
+
+@app.post("/api/audit/ai")
+async def run_ai_audit(request: AuditRequest) -> dict[str, Any]:
+    dataset, dataframe = get_dataset_sheet(request.file_id, request.sheet_name)
+    summary = dataset.get("audit_summaries", {}).get(request.sheet_name)
+    if summary is None:
+        summary = compile_audit_summary(dataset["filename"], request.sheet_name, dataframe)
+        dataset.setdefault("audit_summaries", {})[request.sheet_name] = summary
+    anomalies = dataset.get("anomaly_reports", {}).get(request.sheet_name)
+    if anomalies is None:
+        anomalies = anomaly_report(dataframe)
+        dataset.setdefault("anomaly_reports", {})[request.sheet_name] = anomalies
+    try:
+        answer = local_ai.audit_with_local_model(audit_prompt(summary, anomalies))
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    result = {
+        "audit": answer,
+        "summary": summary,
+        "model": local_ai.model_status(),
+        "local_only": True,
+    }
+    dataset.setdefault("ai_audits", {})[request.sheet_name] = result
+    return result
+
+
+def _unique_sheet_name(base: str, used: set[str]) -> str:
+    cleaned = re.sub(r"[\[\]:*?/\\]", "_", base).strip("'") or "Məlumat"
+    cleaned = cleaned[:31]
+    candidate = cleaned
+    suffix = 2
+    while candidate.casefold() in used:
+        tail = f" ({suffix})"
+        candidate = f"{cleaned[:31 - len(tail)]}{tail}"
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+def _write_frame_sheet(
+    workbook: Workbook,
+    name: str,
+    dataframe: pd.DataFrame,
+    used: set[str],
+    formatting: dict[str, Any] | None = None,
+) -> Any:
+    worksheet = workbook.create_sheet(_unique_sheet_name(name, used))
+    header_fill = PatternFill("solid", fgColor="243044")
+    header_font = Font(name="Aptos", bold=True, color="FFFFFF")
+    for column_number, column in enumerate(dataframe.columns, start=1):
+        cell = worksheet.cell(1, column_number, str(column))
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    cell_metadata = (formatting or {}).get("cells", {})
+    for row_number, values in enumerate(dataframe.itertuples(index=False, name=None), start=2):
+        style_row = cell_metadata.get(str(row_number - 2), {})
+        for column_number, value in enumerate(values, start=1):
+            if isinstance(value, (list, tuple, dict, set)):
+                value = json.dumps(value, ensure_ascii=False, default=str)
+            elif pd.isna(value):
+                value = None
+            elif isinstance(value, pd.Timestamp):
+                value = value.to_pydatetime().replace(tzinfo=None)
+            elif hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, (float, int)) and not isinstance(value, bool):
+                if not math.isfinite(float(value)):
+                    value = None
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+                value = "'" + value
+            cell = worksheet.cell(row_number, column_number, value)
+            column_name = str(dataframe.columns[column_number - 1])
+            style = style_row.get(column_name)
+            if style:
+                if style.get("fill_rgb"):
+                    cell.fill = PatternFill("solid", fgColor=style["fill_rgb"])
+                if style.get("font_rgb") or style.get("bold"):
+                    cell.font = Font(
+                        name="Aptos",
+                        bold=style.get("bold", False),
+                        color=style.get("font_rgb"),
+                    )
+                if style.get("comment"):
+                    from openpyxl.comments import Comment
+
+                    cell.comment = Comment(str(style["comment"]), "DataLens")
+    for column_number, column in enumerate(dataframe.columns, start=1):
+        values = dataframe[column].tolist()
+        max_length = max(
+            [len(str(column))]
+            + [len(str(value)) for value in values if not pd.isna(value)]
+        )
+        worksheet.column_dimensions[get_column_letter(column_number)].width = min(
+            max(max_length + 2, 10), 50
+        )
+    return worksheet
+
+
+@app.post("/api/export/full")
+async def export_full_workbook(request: FullExportRequest) -> Response:
+    dataset, selected_frame = get_dataset_sheet(request.file_id, request.sheet_name)
+    summary = dataset.get("audit_summaries", {}).get(request.sheet_name) or compile_audit_summary(
+        dataset["filename"], request.sheet_name, selected_frame
+    )
+    anomalies = dataset.get("anomaly_reports", {}).get(request.sheet_name) or anomaly_report(selected_frame)
+    ai_audit = dataset.get("ai_audits", {}).get(request.sheet_name, {})
+    colors = color_analysis_for_file(request.file_id) if dataset.get("workbook_bytes") else {"groups": []}
+    analysis = analytics_dataframe(selected_frame)
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    used: set[str] = set()
+    summary_frame = pd.DataFrame(
+        [
+            {"Göstərici": key, "Dəyər": value}
+            for key, value in summary.items()
+            if not isinstance(value, (list, dict))
+        ]
+    )
+    _write_frame_sheet(workbook, "Xülasə", summary_frame, used)
+
+    audit_text = ai_audit.get(
+        "audit",
+        "AI auditi aparılmayıb. Model yalnız yerli olaraq endirilib yükləndikdən sonra AI auditi başladılır.",
+    )
+    _write_frame_sheet(
+        workbook,
+        "AI auditi",
+        pd.DataFrame({"Yerli AI auditı": audit_text.splitlines() or [audit_text]}),
+        used,
+    )
+
+    color_rows: list[dict[str, Any]] = []
+    for group in colors.get("groups", []):
+        if not group["numeric_metrics"]:
+            color_rows.append(
+                {
+                    "Rəng": group["color"],
+                    "Sətir sayı": group["row_count"],
+                    "Mənbə vərəqləri": ", ".join(group["sheets"]),
+                }
+            )
+        for metric in group["numeric_metrics"]:
+            color_rows.append(
+                {
+                    "Rəng": group["color"],
+                    "Sütun": metric["column"],
+                    "Sətir sayı": group["row_count"],
+                    "Cəm": metric["sum"],
+                    "Orta": metric["average"],
+                    "Aşağı": metric["tiers"]["low"],
+                    "Orta səviyyə": metric["tiers"]["medium"],
+                    "Yüksək": metric["tiers"]["high"],
+                    "Mənbə vərəqləri": ", ".join(group["sheets"]),
+                }
+            )
+    _write_frame_sheet(
+        workbook,
+        "Rəng analizi",
+        pd.DataFrame(color_rows or [{"Məlumat": "Rəngli xana tapılmadı"}]),
+        used,
+    )
+
+    grouped_rows: list[dict[str, Any]] = []
+    for sheet_name, dataframe in dataset["sheets"].items():
+        group_columns = dataframe.select_dtypes(include=["object", "string", "category"]).columns
+        numeric_columns = dataframe.select_dtypes(include="number").columns
+        for group_column in group_columns:
+            result = analytics_dataframe(
+                dataframe,
+                group_by=str(group_column),
+                metric=str(numeric_columns[0]) if len(numeric_columns) else None,
+            )
+            for item in result["grouped_summary"]:
+                grouped_rows.append(
+                    {
+                        "Vərəq": sheet_name,
+                        "Qruplaşdırma sütunu": str(group_column),
+                        "Dəyər": item.get("group_value"),
+                        "Sətir sayı": item.get("row_count"),
+                        "Cəm": item.get("total"),
+                        "Orta": item.get("average"),
+                    }
+                )
+    _write_frame_sheet(
+        workbook,
+        "Qruplaşdırma",
+        pd.DataFrame(grouped_rows or [{"Məlumat": "Qruplaşdırıla bilən kateqorik sütun yoxdur"}]),
+        used,
+    )
+
+    reconciliation = reconciliation_reports.get(request.file_id)
+    if reconciliation:
+        recon_frame = pd.DataFrame(reconciliation["rows"])
+        recon_sheet = _write_frame_sheet(workbook, "Uzlaşma", recon_frame, used)
+        recon_sheet.append([])
+        recon_sheet.append(["Sol cəm", reconciliation["totals"]["left"]])
+        recon_sheet.append(["Sağ cəm", reconciliation["totals"]["right"]])
+        recon_sheet.append(["Xalis fərq", reconciliation["totals"]["net_difference"]])
+        for row_number, item in enumerate(reconciliation["rows"], start=2):
+            color = {
+                "MATCH": "C6EFCE",
+                "AMOUNT_DIFF": "FFEB9C",
+                "LEFT_ONLY": "FFC7CE",
+                "RIGHT_ONLY": "FFC7CE",
+            }.get(item["status"], "FFFFFF")
+            for cell in recon_sheet[row_number]:
+                cell.fill = PatternFill("solid", fgColor=color)
+    else:
+        _write_frame_sheet(
+            workbook,
+            "Uzlaşma",
+            pd.DataFrame({"Məlumat": ["Vərəqlərarası uzlaşma aparılmayıb"]}),
+            used,
+        )
+
+    anomaly_rows = anomalies["numeric_anomalies"] + anomalies["fuzzy_text_matches"]
+    _write_frame_sheet(
+        workbook,
+        "Anomaliyalar",
+        pd.DataFrame(anomaly_rows or [{"Məlumat": "Aşkarlanan anomaliya yoxdur"}]),
+        used,
+    )
+
+    for sheet_name, dataframe in dataset["sheets"].items():
+        _write_frame_sheet(
+            workbook,
+            f"Təmizlənmiş · {sheet_name}",
+            dataframe,
+            used,
+            dataset.get("formatting", {}).get(sheet_name),
+        )
+
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return Response(
+        content=output.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": attachment_header(
+                export_filename(request.file_id, "xlsx").replace(".xlsx", "_tam_hesabat.xlsx")
+            )
+        },
+    )
+
+
+@app.post("/api/clean/smart")
+async def smart_clean_sheet(request: SmartCleaningRequest) -> dict[str, Any]:
+    dataset, original = get_dataset_sheet(request.file_id, request.sheet_name)
+    duplicates = int(original.duplicated().sum())
+    options = CleaningRequest(
+        file_id=request.file_id,
+        sheet_name=request.sheet_name,
+        remove_duplicates=duplicates > 0,
+        standardize_dates=True,
+    )
+    cleaned, messages, changed_cells, row_indices = clean_dataframe(original, options)
+    trimmed = 0
+    for column in cleaned.select_dtypes(include=["object", "string"]).columns:
+        before = cleaned[column]
+        after = before.map(
+            lambda value: re.sub(r"\s+", " ", value.strip())
+            if isinstance(value, str)
+            else value
+        )
+        trimmed += int(
+            sum(
+                isinstance(value, str) and value != result
+                for value, result in zip(before, after)
+            )
+        )
+        cleaned[column] = after
+    if trimmed:
+        messages.append(f"{trimmed} mətn xanasında kənar və təkrarlanan boşluqlar düzəldildi")
+    messages = messages or ["Dəyişiklik tələb edən təmizləmə problemi aşkarlanmadı"]
+    ai_suggestion = None
+    ai_warning = None
+    if request.use_ai:
+        summary = compile_audit_summary(dataset["filename"], request.sheet_name, original)
+        try:
+            ai_suggestion = local_ai.audit_with_local_model(
+                "Aşağıdakı Excel keyfiyyət xülasəsinə əsasən yalnız təhlükəsiz "
+                "təmizləmə tövsiyələri ver; heç bir dəyəri özbaşına dəyişdirmə.\n"
+                + audit_prompt(summary, anomaly_report(original))
+            )
+        except (RuntimeError, ValueError) as error:
+            ai_warning = (
+                f"Yerli AI hazır olmadığı üçün deterministik təmizləmə tətbiq edildi: {error}"
+            )
+    dataset["previews"][request.sheet_name] = {
+        "dataframe": cleaned,
+        "messages": messages,
+        "has_changes": not original.equals(cleaned),
+    }
+    return {
+        "columns": [str(column) for column in original.columns],
+        "original_rows": json_rows(original),
+        "rows": json_rows(cleaned),
+        "row_indices": row_indices,
+        "changed_cells": changed_cells,
+        "preview_log": messages,
+        "has_changes": not original.equals(cleaned),
+        "ai_suggestion": ai_suggestion,
+        "ai_warning": ai_warning,
+        "fallback": True,
+    }
